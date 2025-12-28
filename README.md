@@ -146,6 +146,24 @@ G1 X62.123 Y406.999 Z-1.000 A15.196 F1000
 
 ---
 
+## Screenshots
+
+### Main UI
+![Main UI](docs/screenshots/ui-main.png)
+
+### 2D A-axis generation
+![2D A axis](docs/screenshots/tab-2d-a-axis.png)
+
+### 3D simulation
+![3D Sim](docs/screenshots/tab-3d-sim.png)
+
+### G-code export
+![G-code](docs/screenshots/gcode-export.png)
+
+### Portable config
+![Portable config](docs/screenshots/settings-portable.png)
+
+
 ## 📜 Lisans
 
 Bu proje **MIT License** ile lisanslanmıştır. Ayrıntılar için `LICENSE` dosyasına bakın.
