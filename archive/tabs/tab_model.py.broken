@@ -1,0 +1,745 @@
+# tabs/tab_model.py
+# ----------------------------------------------------------
+# "Model Yükleme" sekmesi
+# - Sol panel: Model Yükle / Model Düzenle
+# - Orta: GLTableViewer (tabla + STL önizleme)
+# - Sağ: model döndürme, görünümü sıfırla, model pozisyonu,
+#        model bilgileri
+# - Alt: tablo / G53 / G54 / model bilgisi mesaj alanı
+# ----------------------------------------------------------
+
+import os
+import time
+import configparser
+import logging
+
+from PyQt5.QtWidgets import (
+    QWidget,
+    QHBoxLayout,
+    QVBoxLayout,
+    QFrame,
+    QLabel,
+    QPushButton,
+    QFileDialog,
+    QGroupBox,
+    QGridLayout,
+    QDoubleSpinBox,
+    QMessageBox,
+    QApplication,
+    QProgressBar,
+    QSizePolicy,
+)
+from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, QThreadPool
+
+
+INI_PATH = "settings.ini"
+import numpy as np
+from gl_viewer import GLTableViewer
+from async_workers import WorkerRunnable
+from ui_strings import (TITLE_MODEL, TITLE_TOOLPATH, MSG_MODEL_LOAD_ERROR, MSG_OPERATION_CANCELLED, MSG_MODEL_REQUIRED)
+from stl import mesh as stl_mesh
+logger = logging.getLogger(__name__)
+
+
+class TabModel(QWidget):
+    def __init__(self, main_window, state):
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.state = state
+
+        # GL viewer
+        self.viewer = GLTableViewer(self)
+        if hasattr(self.viewer, "reset_camera"):
+            self.viewer.reset_camera()
+        self.viewer.on_load_error = self._on_stl_load_error
+
+        # Mevcut tabla / G54 ayarları
+        self.table_width_mm = 800.0
+        self.table_height_mm = 400.0
+        self.origin_mode = "center"  # center, front_left, ...
+
+        # Model durumu
+        self.model_loaded = False
+        self.model_path = None
+
+        # Rotasyon açıları (derece)
+        self.model_rot_x = 0.0
+        self.model_rot_y = 0.0
+        self.model_rot_z = 0.0
+
+        # Tabla dolu mu sadece grid mi? (settings'ten gelecek)
+        self.table_fill_enabled = True
+
+        # Yol oluştur butonu referansı
+        self.btn_create_path = None
+        self.btn_create_path = None
+        self.threadpool = QThreadPool.globalInstance()
+        self._load_worker = None
+        self._build_ui()
+
+        # settings.ini'den tabla + renk ayarlarını yükle
+        self._load_settings_from_ini()
+
+    # ------------------------------------------------------
+    # UI kurulumu
+    # ------------------------------------------------------
+    def _build_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        # Üst kısım: sol panel + viewer + sağ panel
+        top_layout = QHBoxLayout()
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(0)
+
+        self.left_panel = self._build_left_panel()
+        self.right_panel = self._build_right_panel()
+
+        # Orta panel (viewer)
+        center_frame = QFrame()
+        center_frame.setFrameShape(QFrame.StyledPanel)
+        center_layout = QVBoxLayout(center_frame)
+        center_layout.setContentsMargins(0, 0, 0, 0)
+        center_layout.addWidget(self.viewer)
+
+        top_layout.addWidget(self.left_panel)
+        top_layout.addWidget(center_frame, 1)
+        top_layout.addWidget(self.right_panel)
+
+        # Alt mesaj paneli
+        self.bottom_frame = QFrame()
+        self.bottom_frame.setFrameShape(QFrame.StyledPanel)
+        bottom_layout = QVBoxLayout(self.bottom_frame)
+        bottom_layout.setContentsMargins(6, 4, 6, 4)
+
+        self.bottom_label_title = QLabel("Model Yükleme Bilgileri / Mesajlar")
+        self.bottom_label_title.setFont(QFont("Segoe UI", 8, QFont.Bold))
+
+        self.bottom_label_info = QLabel("")
+        self.bottom_label_info.setFont(QFont("Segoe UI", 8))
+        self.bottom_label_info.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.bottom_label_info.setWordWrap(True)
+
+        bottom_layout.addWidget(self.bottom_label_title)
+        bottom_layout.addWidget(self.bottom_label_info)
+
+        main_layout.addLayout(top_layout, 1)
+        main_layout.addWidget(self.bottom_frame, 0)
+
+        self.setLayout(main_layout)
+
+    # ------------------------------------------------------
+    # Sol panel
+    # ------------------------------------------------------
+    def _build_left_panel(self):
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setMinimumWidth(220)
+        frame.setMaximumWidth(260)
+        frame.setStyleSheet("background-color: #f5f5fa;")
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        lbl_title = QLabel("Modeller")
+        lbl_title.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        layout.addWidget(lbl_title)
+
+        btn_load = QPushButton("Model Yükle")
+        btn_load.setCursor(Qt.PointingHandCursor)
+        btn_load.clicked.connect(self._on_load_model)
+        layout.addWidget(btn_load)
+
+        lbl_offset = QLabel("Kontur Ofseti (mm)")
+        lbl_offset.setFont(QFont("Segoe UI", 8))
+        layout.addWidget(lbl_offset)
+
+        self.spin_model_offset = QDoubleSpinBox()
+        self.spin_model_offset.setRange(-5.0, 5.0)
+        self.spin_model_offset.setDecimals(2)
+        self.spin_model_offset.setSingleStep(0.1)
+        self.spin_model_offset.setValue(0.0)
+        self.spin_model_offset.valueChanged.connect(self._on_model_offset_changed)
+        layout.addWidget(self.spin_model_offset)
+        # Alternatif isim
+        self.spin_contour_offset = self.spin_model_offset
+
+        # Model yüklendikten sonra aktif olacak Yol Oluştur butonu
+        self.btn_create_path = QPushButton("Yol Oluştur")
+        self.btn_create_path.setCursor(Qt.PointingHandCursor)
+        self.btn_create_path.setEnabled(False)
+        # Takım yolu oluşturma slotuna bağla
+        self.btn_create_path.clicked.connect(self._on_create_toolpath)
+        layout.addWidget(self.btn_create_path)
+        layout.addStretch(1)
+        return frame
+
+    # ------------------------------------------------------
+    # Sağ panel
+    # ------------------------------------------------------
+    def _build_right_panel(self):
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setMinimumWidth(230)
+        frame.setMaximumWidth(270)
+        frame.setStyleSheet("background-color: #f0f0f0;")
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self.label_right_info = QLabel(
+            "Model yüklendikten sonra\n"
+            "buraya seçenekler gelecek."
+        )
+        self.label_right_info.setFont(QFont("Segoe UI", 8))
+        self.label_right_info.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self.label_right_info)
+
+        # --- Model Döndürme grubu ---
+        grp_rot = QGroupBox("Model Döndürme (90° adımlar)")
+        grp_rot_layout = QVBoxLayout(grp_rot)
+        grp_rot_layout.setSpacing(4)
+
+        def add_rot_row(text, minus_cb, plus_cb):
+            row = QHBoxLayout()
+            lbl = QLabel(text)
+            btn_minus = QPushButton("-90°")
+            btn_plus = QPushButton("+90°")
+            for b in (btn_minus, btn_plus):
+                b.setCursor(Qt.PointingHandCursor)
+                b.setFixedWidth(60)
+            btn_minus.clicked.connect(minus_cb)
+            btn_plus.clicked.connect(plus_cb)
+            row.addWidget(lbl)
+            row.addStretch(1)
+            row.addWidget(btn_minus)
+            row.addWidget(btn_plus)
+            grp_rot_layout.addLayout(row)
+
+        add_rot_row("Rot X:", self._on_rot_x_minus, self._on_rot_x_plus)
+        add_rot_row("Rot Y:", self._on_rot_y_minus, self._on_rot_y_plus)
+        add_rot_row("Rot Z:", self._on_rot_z_minus, self._on_rot_z_plus)
+
+        grp_rot.setEnabled(False)
+        self.grp_model_rotate = grp_rot
+        layout.addWidget(grp_rot)
+
+        # --- Görünümü Sıfırla butonu ---
+        self.btn_reset_view = QPushButton("Görünümü Sıfırla")
+        self.btn_reset_view.setCursor(Qt.PointingHandCursor)
+        self.btn_reset_view.clicked.connect(self._on_reset_view_clicked)
+        layout.addWidget(self.btn_reset_view)
+
+        # --- Model Pozisyonu grubu ---
+        pos_grp = QGroupBox("Model Pozisyonu (mm)")
+        pos_layout = QGridLayout(pos_grp)
+
+        lbl_px = QLabel("X:")
+        lbl_py = QLabel("Y:")
+        lbl_pz = QLabel("Z:")
+
+        self.spin_pos_x = QDoubleSpinBox()
+        self.spin_pos_y = QDoubleSpinBox()
+        self.spin_pos_z = QDoubleSpinBox()
+
+        for sp in (self.spin_pos_x, self.spin_pos_y, self.spin_pos_z):
+            sp.setRange(-1000.0, 1000.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(1.0)
+
+        self.spin_pos_x.valueChanged.connect(self._on_position_changed)
+        self.spin_pos_y.valueChanged.connect(self._on_position_changed)
+        self.spin_pos_z.valueChanged.connect(self._on_position_changed)
+
+        btn_pos_reset = QPushButton("Sıfırla")
+        btn_pos_reset.setCursor(Qt.PointingHandCursor)
+        btn_pos_reset.clicked.connect(self._on_position_reset)
+
+        pos_layout.addWidget(lbl_px, 0, 0)
+        pos_layout.addWidget(self.spin_pos_x, 0, 1)
+        pos_layout.addWidget(lbl_py, 1, 0)
+        pos_layout.addWidget(self.spin_pos_y, 1, 1)
+        pos_layout.addWidget(lbl_pz, 2, 0)
+        pos_layout.addWidget(self.spin_pos_z, 2, 1)
+        pos_layout.addWidget(btn_pos_reset, 3, 0, 1, 2)
+
+        pos_grp.setEnabled(False)
+        self.grp_model_position = pos_grp
+        layout.addWidget(pos_grp)
+
+        # --- Model Bilgileri grubu ---
+        info_grp = QGroupBox("Model Bilgileri")
+        info_layout = QVBoxLayout(info_grp)
+        info_layout.setContentsMargins(6, 6, 6, 6)
+
+        self.label_model_info = QLabel("Henüz model yok.")
+        self.label_model_info.setFont(QFont("Segoe UI", 8))
+        self.label_model_info.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.label_model_info.setWordWrap(True)
+
+        info_layout.addWidget(self.label_model_info)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(16)
+        self.progress_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        info_layout.addWidget(self.progress_bar)
+
+        self.label_progress = QLabel("")
+        self.label_progress.setFont(QFont("Segoe UI", 8))
+        self.label_progress.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.label_progress.setWordWrap(True)
+        info_layout.addWidget(self.label_progress)
+
+        self.label_timer = QLabel("")
+        self.label_timer.setFont(QFont("Segoe UI", 8))
+        self.label_timer.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.label_timer.setWordWrap(True)
+        info_layout.addWidget(self.label_timer)
+        info_grp.setEnabled(False)
+        self.grp_model_info = info_grp
+
+        layout.addWidget(info_grp)
+
+        layout.addStretch(1)
+        return frame
+
+    # ------------------------------------------------------
+    # settings.ini'den tablo / renk ayarlarını çek
+    # ------------------------------------------------------
+    def _load_settings_from_ini(self):
+        if not os.path.exists(INI_PATH):
+            # INI yoksa varsayılanlarla aç
+            self.apply_table_settings(
+                width_mm=self.table_width_mm,
+                height_mm=self.table_height_mm,
+                origin_mode="center",
+                bg_color="#E6E6EB",
+                table_color="#D5E4F0",
+                stl_color="#FF6699",
+                table_fill_enabled=True,
+            )
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg.read(INI_PATH, encoding="utf-8")
+
+        width = cfg.getfloat("TABLE", "width_mm", fallback=self.table_width_mm)
+        height = cfg.getfloat("TABLE", "height_mm", fallback=self.table_height_mm)
+        origin_mode = cfg.get("TABLE", "origin_mode", fallback="center")
+
+        bg = cfg.get("COLORS", "background", fallback="#E6E6EB")
+        table_c = cfg.get("COLORS", "table", fallback="#D5E4F0")
+        stl_c = cfg.get("COLORS", "stl", fallback="#FF6699")
+
+        show_fill = cfg.getboolean("TABLE", "show_table_fill", fallback=True)
+        contour_offset = cfg.getfloat("APP", "contour_offset_mm", fallback=0.0)
+
+        self.apply_table_settings(
+            width, height, origin_mode, bg, table_c, stl_c, table_fill_enabled=show_fill
+        )
+        try:
+            self.spin_model_offset.blockSignals(True)
+            self.spin_model_offset.setValue(contour_offset)
+        finally:
+            self.spin_model_offset.blockSignals(False)
+
+    def apply_table_settings(
+        self,
+        width_mm,
+        height_mm,
+        origin_mode,
+        bg_color=None,
+        table_color=None,
+        stl_color=None,
+        table_fill_enabled=True,
+    ):
+        """
+        Ayarlar sekmesinden ve eski çağrılardan kullanılabilir.
+
+        - Eğer renk parametreleri gelirse: onları kullan.
+        - Eğer gelmezse: settings.ini içindeki [COLORS] bölümünü oku.
+        - table_fill_enabled: True => tabla dolu, False => sadece grid
+        """
+
+        self.table_width_mm = float(width_mm)
+        self.table_height_mm = float(height_mm)
+        self.origin_mode = origin_mode
+        self.table_fill_enabled = bool(table_fill_enabled)
+
+        # Önce varsayılan renkler
+        if not hasattr(self, "bg_color_hex"):
+            self.bg_color_hex = "#E6E6EB"
+            self.table_color_hex = "#D5E4F0"
+            self.stl_color_hex = "#FF6699"
+
+        # Parametre yoksa ini'den al
+        if bg_color is None or table_color is None or stl_color is None:
+            cfg = configparser.ConfigParser()
+            if cfg.read(INI_PATH, encoding="utf-8"):
+                bg_ini = cfg.get("COLORS", "background", fallback=self.bg_color_hex)
+                tbl_ini = cfg.get("COLORS", "table", fallback=self.table_color_hex)
+                stl_ini = cfg.get("COLORS", "stl", fallback=self.stl_color_hex)
+            else:
+                bg_ini = self.bg_color_hex
+                tbl_ini = self.table_color_hex
+                stl_ini = self.stl_color_hex
+
+            bg_color = bg_color or bg_ini
+            table_color = table_color or tbl_ini
+            stl_color = stl_color or stl_ini
+
+        # Son kullanılanları sakla
+        self.bg_color_hex = bg_color
+        self.table_color_hex = table_color
+        self.stl_color_hex = stl_color
+
+        # Viewer'a uygula
+        self.viewer.set_table_size(self.table_width_mm, self.table_height_mm)
+        self.viewer.set_origin_mode(self.origin_mode)
+        self.viewer.set_colors(bg_color, table_color, stl_color)
+        self.viewer.set_table_fill_enabled(self.table_fill_enabled)
+
+        # Alt paneli güncelle
+        self._update_bottom_panel_text()
+
+    # ------------------------------------------------------
+    # Alt panel metni
+    # ------------------------------------------------------
+    def _origin_mode_human(self):
+        mapping = {
+            "center": "Orta",
+            "front_left": "Sol Alt (X min, Y min)",
+            "front_right": "Sağ Alt (X max, Y min)",
+            "back_left": "Sol Üst (X min, Y max)",
+            "back_right": "Sağ Üst (X max, Y max)",
+        }
+        return mapping.get(self.origin_mode, self.origin_mode)
+
+    def _update_bottom_panel_text(self, model_name=None):
+        lines = []
+        lines.append(
+            f"Tabla boyutu: {self.table_width_mm:.1f} x "
+            f"{self.table_height_mm:.1f} mm"
+        )
+        lines.append("G53 Orjini: Makine 0,0,0 (tabla sol alt köşe)")
+        lines.append(f"G54 Orjini: {self._origin_mode_human()}")
+
+        if model_name is None:
+            if self.model_path:
+                base = os.path.basename(self.model_path)
+                lines.append(f"Yüklü model: {base}")
+            else:
+                lines.append("Henüz hiçbir model yüklenmedi.")
+        else:
+            lines.append(f"Yüklü model: {model_name}")
+
+        self.bottom_label_info.setText("\n".join(lines))
+
+    # ------------------------------------------------------
+    # Model yükleme
+    # ------------------------------------------------------
+    def _on_load_model(self):
+        dlg = QFileDialog(self)
+        dlg.setWindowTitle("STL Model Yükle")
+        dlg.setNameFilter("STL Dosyaları (*.stl *.STL)")
+        dlg.setFileMode(QFileDialog.ExistingFile)
+        if dlg.exec_() != QFileDialog.Accepted:
+            return
+
+        filenames = dlg.selectedFiles()
+        if not filenames:
+            return
+
+        filename = filenames[0]
+        self.model_path = filename
+
+        if self._load_worker:
+            try:
+                self._load_worker.cancel()
+            except Exception:
+                logger.exception("Önceki STL yükleme iptali başarısız")
+
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setValue(0)
+            self.label_progress.setText("Yükleniyor...")
+            self.label_timer.setText("")
+
+        self._load_worker = WorkerRunnable(self._load_stl_async, filename)
+        self._load_worker.signals.progress.connect(self._on_load_progress)
+        self._load_worker.signals.result.connect(self._on_load_result)
+        self._load_worker.signals.error.connect(self._on_load_error_signal)
+        self._load_worker.signals.finished.connect(self._on_load_finished)
+        self.threadpool.start(self._load_worker)
+    def _load_stl_async(self, worker, filename: str):
+        worker.signals.progress.emit("Dosya okunuyor", 5)
+        m = stl_mesh.Mesh.from_file(filename)
+        vectors = m.vectors.astype(np.float32)
+        num_triangles = vectors.shape[0]
+        verts = vectors.reshape(-1, 3)
+        tri_normals = m.normals.astype(np.float32)
+        normals = np.repeat(tri_normals, 3, axis=0)
+        min_xyz = verts.min(axis=0)
+        max_xyz = verts.max(axis=0)
+        size_xyz = max_xyz - min_xyz
+        center_xy = (min_xyz[0:2] + max_xyz[0:2]) / 2.0
+        verts[:, 0] -= center_xy[0]
+        verts[:, 1] -= center_xy[1]
+        verts[:, 2] -= min_xyz[2]
+        worker.signals.progress.emit("Veri haz?r", 90)
+        return {
+            "vertices": verts.astype(np.float32),
+            "normals": normals.astype(np.float32),
+            "size": size_xyz.astype(np.float32),
+            "triangles": num_triangles,
+            "path": filename,
+        }
+
+    def _on_load_progress(self, message: str, percent: int):
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setValue(int(percent))
+            self.label_progress.setText(message or "")
+            QApplication.processEvents()
+
+    def _on_load_result(self, payload: dict):
+        try:
+            verts = payload.get("vertices")
+            size_xyz = payload.get("size")
+            path = payload.get("path")
+            self.viewer.set_mesh_data(verts, payload.get("normals"), size_xyz)
+            self.model_loaded = True
+            base = os.path.basename(path) if path else ""
+            self.model_path = path
+            self._update_bottom_panel_text(model_name=base)
+            self.label_right_info.setText("Model y?klendi.
+90? ad?mlarla d?nd?rebilirsiniz.")
+            self.grp_model_rotate.setEnabled(True)
+            self.grp_model_position.setEnabled(True)
+            self.grp_model_info.setEnabled(True)
+            if self.btn_create_path:
+                self.btn_create_path.setEnabled(True)
+
+            if hasattr(self.main_window, "tab_toolpath"):
+                try:
+                    self.main_window.tab_toolpath.offset_spin.blockSignals(True)
+                    self.main_window.tab_toolpath.offset_spin.setValue(self.spin_model_offset.value())
+                finally:
+                    self.main_window.tab_toolpath.offset_spin.blockSignals(False)
+
+            self.model_rot_x = 0.0
+            self.model_rot_y = 0.0
+            self.model_rot_z = 0.0
+            self._apply_model_rotation()
+
+            self.spin_pos_x.blockSignals(True)
+            self.spin_pos_y.blockSignals(True)
+            self.spin_pos_z.blockSignals(True)
+            self.spin_pos_x.setValue(0.0)
+            self.spin_pos_y.setValue(0.0)
+            self.spin_pos_z.setValue(0.0)
+            self.spin_pos_x.blockSignals(False)
+            self.spin_pos_y.blockSignals(False)
+            self.spin_pos_z.blockSignals(False)
+            self.viewer.set_model_offset(0.0, 0.0, 0.0)
+
+            if verts is not None:
+                txt = (
+                    f"Vertex say?s? : {len(verts)}
+"
+                    f"??gen say?s? : {payload.get('triangles', 0)}
+"
+                    f"Boyutlar (X x Y x Z):
+"
+                    f"{size_xyz[0]:.3f} x {size_xyz[1]:.3f} x {size_xyz[2]:.3f} mm"
+                )
+            else:
+                txt = "Bilgi al?namad?."
+            self.label_model_info.setText(txt)
+        except Exception:
+            logger.exception("STL y?kleme sonucu UI'a uygulanamad?")
+            QMessageBox.critical(self, TITLE_MODEL, MSG_MODEL_LOAD_ERROR)
+        finally:
+            if hasattr(self, "progress_bar"):
+                self.progress_bar.setValue(100)
+                self.label_progress.setText("Haz?r")
+                self.label_timer.setText("")
+
+    def _on_load_error_signal(self, user_message: str, exc_text: str):
+        logger.error("STL y?kleme hatas?: %s", exc_text)
+        QMessageBox.critical(self, TITLE_MODEL, MSG_MODEL_LOAD_ERROR)
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setValue(0)
+            self.label_progress.setText("")
+            self.label_timer.setText("")
+    def _on_load_error_signal(self, user_message: str, exc_text: str):
+        logger.error("STL y?kleme hatas?: %s", exc_text)
+        QMessageBox.critical(self, TITLE_MODEL, MSG_MODEL_LOAD_ERROR)
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setValue(0)
+            self.label_progress.setText("")
+            self.label_timer.setText("")
+def _on_load_error_signal(self, user_message: str, exc_text: str):
+        logger.error("STL y?kleme hatas?: %s", exc_text)
+        QMessageBox.critical(self, "STL Y?kleme", f"{user_message}
+{exc_text}")
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.setValue(0)
+            self.label_progress.setText("")
+            self.label_timer.setText("")
+
+    def _on_load_finished(self):
+        self._load_worker = None
+    def _on_create_toolpath(self):
+        """Sol paneldeki 'Yol Olu?tur' butonuna bas?nca ?a??r?l?r."""
+        main = self.main_window
+        if main is None or not hasattr(main, "tab_toolpath"):
+            QMessageBox.warning(
+                self,
+                "Tak?m Yolu",
+                "Ana pencerede 'Tak?m Yolu' sekmesi bulunamad?.",
+            )
+            return
+
+        if not getattr(self, "model_loaded", False):
+            QMessageBox.warning(
+                self,
+                "Tak?m Yolu",
+                "?nce Model Y?kleme sekmesinden ge?erli bir STL dosyas? y?kleyin.",
+            )
+            return
+
+        tool_tab = main.tab_toolpath
+
+        try:
+            tool_tab.offset_spin.blockSignals(True)
+            tool_tab.offset_spin.setValue(self.spin_model_offset.value())
+        finally:
+            tool_tab.offset_spin.blockSignals(False)
+        try:
+            tool_tab._on_params_changed()
+        except Exception:
+            logger.exception("Takım yolu parametreleri senkronize edilirken hata")
+
+        # Geçerli modelden takım yolu üretirken ilerlemeyi sağ panelde göster
+        start_time = time.perf_counter()
+
+        def _progress(p, msg=""):
+            if hasattr(self, "progress_bar"):
+                self.progress_bar.setValue(int(p))
+                self.label_progress.setText(f"{int(p)}% - {msg}" if msg else f"{int(p)}%")
+                elapsed = time.perf_counter() - start_time
+                self.label_timer.setText(f"Geçen süre: {elapsed:.1f} sn")
+            QApplication.processEvents()
+        tool_tab.generate_from_current_model(progress_cb=_progress)
+
+        elapsed_total = time.perf_counter() - start_time
+        QMessageBox.information(
+            self,
+            "Takım Yolu",
+            f"Takım yolu üretimi tamamlandı.\nGeçen süre: {elapsed_total:.2f} saniye.",
+        )
+
+        # Tak?m yolu sekmesini ?ne getir
+        main.tabs.setCurrentWidget(tool_tab)
+
+
+    def _on_model_offset_changed(self, value: float):
+        """Model sekmesindeki ofset spin de?i?ince Tak?m Yolu sekmesine aktar?r."""
+        if hasattr(self.main_window, 'tab_toolpath'):
+            tp = self.main_window.tab_toolpath
+            try:
+                tp.offset_spin.blockSignals(True)
+                tp.offset_spin.setValue(float(value))
+            finally:
+                tp.offset_spin.blockSignals(False)
+        if hasattr(self.main_window, "tab_settings") and self.main_window.tab_settings:
+            self.main_window.tab_settings.contour_offset_mm = float(value)
+            if hasattr(self.main_window.tab_settings, "spin_contour_offset"):
+                try:
+                    self.main_window.tab_settings.spin_contour_offset.blockSignals(True)
+                    self.main_window.tab_settings.spin_contour_offset.setValue(float(value))
+                finally:
+                    self.main_window.tab_settings.spin_contour_offset.blockSignals(False)
+
+    def set_contour_offset_from_settings(self, value: float):
+        """INI veya Ayarlar sekmesinden gelen kontur ofsetini uygular."""
+        try:
+            self.spin_model_offset.blockSignals(True)
+            self.spin_model_offset.setValue(float(value))
+        finally:
+            self.spin_model_offset.blockSignals(False)
+        if hasattr(self.main_window, "tab_settings") and self.main_window.tab_settings:
+            self.main_window.tab_settings.contour_offset_mm = float(value)
+
+    # ------------------------------------------------------
+    # Rotasyon ve görünüm
+    # ------------------------------------------------------
+    def _apply_model_rotation(self):
+        if self.viewer is not None:
+            self.viewer.set_model_rotation(
+                self.model_rot_x, self.model_rot_y, self.model_rot_z
+            )
+
+    def _on_rot_x_minus(self):
+        self.model_rot_x -= 90.0
+        self._apply_model_rotation()
+
+    def _on_rot_x_plus(self):
+        self.model_rot_x += 90.0
+        self._apply_model_rotation()
+
+    def _on_rot_y_minus(self):
+        self.model_rot_y -= 90.0
+        self._apply_model_rotation()
+
+    def _on_rot_y_plus(self):
+        self.model_rot_y += 90.0
+        self._apply_model_rotation()
+
+    def _on_rot_z_minus(self):
+        self.model_rot_z -= 90.0
+        self._apply_model_rotation()
+
+    def _on_rot_z_plus(self):
+        self.model_rot_z += 90.0
+        self._apply_model_rotation()
+
+    def _on_reset_view_clicked(self):
+        """Model önizleme kamerasını varsayılan açıya getir."""
+        if self.viewer is not None:
+            self.viewer.reset_view()
+
+    def _on_stl_load_error(self, message: str):
+        QMessageBox.critical(self, "STL Yükleme Hatası", f"STL dosyası yüklenemedi:\n{message}")
+
+    # ------------------------------------------------------
+    # Model pozisyonu (X/Y/Z offset)
+    # ------------------------------------------------------
+    def _on_position_changed(self, value=None):
+        if self.viewer is None:
+            return
+        x = self.spin_pos_x.value()
+        y = self.spin_pos_y.value()
+        z = self.spin_pos_z.value()
+        self.viewer.set_model_offset(x, y, z)
+
+    def _on_position_reset(self):
+        self.spin_pos_x.blockSignals(True)
+        self.spin_pos_y.blockSignals(True)
+        self.spin_pos_z.blockSignals(True)
+
+        self.spin_pos_x.setValue(0.0)
+        self.spin_pos_y.setValue(0.0)
+        self.spin_pos_z.setValue(0.0)
+
+        self.spin_pos_x.blockSignals(False)
+        self.spin_pos_y.blockSignals(False)
+        self.spin_pos_z.blockSignals(False)
+
+        if self.viewer:
+            self.viewer.set_model_offset(0.0, 0.0, 0.0)

@@ -1,0 +1,12 @@
+{
+  "chatgpt.openOnStartup": true,
+
+  "python.analysis.typeCheckingMode": "on",
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "warning",
+    "reportUndefinedVariable": "warning"
+  },
+
+  "python.analysis.autoImportCompletions": true,
+  "python.analysis.indexing": true
+}
