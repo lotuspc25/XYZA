@@ -110,7 +110,7 @@ def resample_polyline_by_step(points: List[ToolpathPoint], step_mm: float, max_d
     if not points:
         return []
     if step_mm <= 0.0:
-        return [ToolpathPoint(p.x, p.y, p.z, 0.0) for p in points]
+        return [ToolpathPoint(p.x, p.y, p.z, p.a) for p in points]
 
     cum_s = [0.0]
     for i in range(1, len(points)):
@@ -122,7 +122,7 @@ def resample_polyline_by_step(points: List[ToolpathPoint], step_mm: float, max_d
 
     total_len = cum_s[-1]
     if total_len <= 1e-6:
-        return [ToolpathPoint(p.x, p.y, p.z, 0.0) for p in points]
+        return [ToolpathPoint(p.x, p.y, p.z, p.a) for p in points]
 
     target_s = []
     s = 0.0
@@ -147,10 +147,10 @@ def resample_polyline_by_step(points: List[ToolpathPoint], step_mm: float, max_d
         x = p0.x + t * (p1.x - p0.x)
         y = p0.y + t * (p1.y - p0.y)
         z = p0.z + t * (p1.z - p0.z)
-        a = p0.a + t * (p1.a - p0.a)
-
-        # A açısı bu aşamada hesaplanmaz, sonradan eklenecek
-        resampled.append(ToolpathPoint(x, y, z, 0.0))
+        a = None
+        if p0.a is not None and p1.a is not None:
+            a = p0.a + t * (p1.a - p0.a)
+        resampled.append(ToolpathPoint(x, y, z, a))
 
     # İsteğe bağlı chord error iyileştirmesi için max_dev_mm kullanılabilir; şimdilik örnekleme sabit tutuluyor.
     return resampled
@@ -190,7 +190,10 @@ def validate_toolpath(
 
     for i, p in enumerate(pts):
         # NaN / eksik kontrolü
-        if any(math.isnan(v) for v in (p.x, p.y, p.z, p.a)):
+        values = [p.x, p.y, p.z]
+        if p.a is not None:
+            values.append(p.a)
+        if any(math.isnan(v) for v in values):
             issues.append(
                 PathIssue(
                     index=i,
@@ -243,7 +246,7 @@ def validate_toolpath(
                 )
             )
 
-        if a_min_deg is not None and p.a < a_min_deg:
+        if a_min_deg is not None and p.a is not None and p.a < a_min_deg:
             issues.append(
                 PathIssue(
                     index=i,
@@ -253,7 +256,7 @@ def validate_toolpath(
                 )
             )
 
-        if a_max_deg is not None and p.a > a_max_deg:
+        if a_max_deg is not None and p.a is not None and p.a > a_max_deg:
             issues.append(
                 PathIssue(
                     index=i,
@@ -266,10 +269,12 @@ def validate_toolpath(
     return issues
 
 
-def _unwrap_angle_delta(a1: float, a2: float) -> float:
+def _unwrap_angle_delta(a1: Optional[float], a2: Optional[float]) -> float:
     """
     A eksenindeki iki açı arasındaki gerçek farkı (-180, +180] aralığında döndürür.
     """
+    if a1 is None or a2 is None:
+        return 0.0
     delta = (a2 - a1 + 180.0) % 360.0 - 180.0
     return delta
 
@@ -715,26 +720,20 @@ def compute_z_for_points(
     margin = max(1.0, (z_max - z_min) * 0.1)
     cont_gap_thresh = max(Z_CONT_GAP_MM, (z_max - z_min) * 0.05)
 
-    intersector = None
+    intersector = getattr(mesh, "ray", None)
     if intersector_cache is not None:
-        intersector = intersector_cache.get(mesh, mesh_version=mesh_version)
-    if intersector is None:
-        intersector = getattr(mesh, "ray", None)
+        cached = intersector_cache.get(mesh, mesh_version=mesh_version)
+        if cached is not None:
+            intersector = cached
 
     def _collect_hits(origins, directions):
         hits_per_point = [[] for _ in range(len(points_xy))]
-        if intersector is None:
-            return hits_per_point
-        try:
-            locs, ray_idx, tri_idx = intersector.intersects_location(
-                ray_origins=origins, ray_directions=directions, multiple_hits=True
-            )
-        except Exception:
-            return hits_per_point
+        locs, ray_idx, tri_idx = intersector.intersects_location(
+            ray_origins=origins, ray_directions=directions, multiple_hits=True
+        )
         if locs is None or len(locs) == 0:
             return hits_per_point
-        normals_mesh = getattr(intersector, "mesh", mesh)
-        face_normals = getattr(normals_mesh, 'face_normals', None)
+        face_normals = getattr(mesh, 'face_normals', None)
         for pt, ridx, fidx in zip(locs, ray_idx, tri_idx):
             if ridx is None or ridx < 0 or ridx >= len(hits_per_point):
                 continue
@@ -868,17 +867,25 @@ def compute_z_for_points(
     return z_vals
 
 
-def build_toolpath_points(xy: np.ndarray, z_vals: np.ndarray, angles_deg: np.ndarray) -> List[ToolpathPoint]:
+def build_toolpath_points(
+    xy: np.ndarray, z_vals: np.ndarray, angles_deg: Optional[np.ndarray] = None
+) -> List[ToolpathPoint]:
     """XY, Z ve açı dizilerinden ToolpathPoint listesi oluşturur."""
-    n = min(len(xy), len(z_vals), len(angles_deg))
+    if angles_deg is None:
+        n = min(len(xy), len(z_vals))
+    else:
+        n = min(len(xy), len(z_vals), len(angles_deg))
     pts: List[ToolpathPoint] = []
     for i in range(n):
+        a_val = None
+        if angles_deg is not None:
+            a_val = float(angles_deg[i])
         pts.append(
             ToolpathPoint(
                 x=float(xy[i, 0]),
                 y=float(xy[i, 1]),
                 z=float(z_vals[i]),
-                a=float(angles_deg[i]),
+                a=a_val,
             )
         )
     return pts
@@ -931,19 +938,26 @@ def generate_gcode_from_points(points: Iterable[ToolpathPoint], cfg: GCodeConfig
         lines.extend(cfg.footer_lines)
         return "\n".join(lines)
 
+    include_a = any(p.a is not None for p in pts)
     p0 = pts[0]
     lines.append(f"G0 X{p0.x:.3f} Y{p0.y:.3f} F{cfg.feed_travel:.2f}")
-    lines.append(f"G0 A{p0.a:.3f}")
+    if include_a:
+        a0 = float(p0.a) if p0.a is not None else 0.0
+        lines.append(f"G0 A{a0:.3f}")
     lines.append(f"G1 Z{p0.z:.3f} F{cfg.feed_z_cut:.2f}")
 
     for p in pts[1:]:
-        lines.append(
-            f"G1 X{p.x:.3f} Y{p.y:.3f} Z{p.z:.3f} A{p.a:.3f} F{cfg.feed_xy_cut:.2f}"
-        )
+        line = f"G1 X{p.x:.3f} Y{p.y:.3f} Z{p.z:.3f} F{cfg.feed_xy_cut:.2f}"
+        if include_a:
+            a_val = float(p.a) if p.a is not None else 0.0
+            line = f"G1 X{p.x:.3f} Y{p.y:.3f} Z{p.z:.3f} A{a_val:.3f} F{cfg.feed_xy_cut:.2f}"
+        lines.append(line)
     if len(pts) > 1:
-        lines.append(
-            f"G1 X{p0.x:.3f} Y{p0.y:.3f} Z{p0.z:.3f} A{p0.a:.3f} F{cfg.feed_xy_cut:.2f}"
-        )
+        line = f"G1 X{p0.x:.3f} Y{p0.y:.3f} Z{p0.z:.3f} F{cfg.feed_xy_cut:.2f}"
+        if include_a:
+            a0 = float(p0.a) if p0.a is not None else 0.0
+            line = f"G1 X{p0.x:.3f} Y{p0.y:.3f} Z{p0.z:.3f} A{a0:.3f} F{cfg.feed_xy_cut:.2f}"
+        lines.append(line)
 
     lines.extend(cfg.footer_lines)
     return "\n".join(lines)
@@ -964,7 +978,7 @@ def generate_outline_toolpath(
     mesh_intersector_cache=None,
     mesh_version: Optional[int] = None,
 ) -> Tuple[List[ToolpathPoint], str, dict]:
-    """STL'den XY kontur + Z takibi + A açılarını hesaplar, ToolpathPoint listesi döndürür."""
+    """STL'den XY kontur + Z takibi hesaplar, ToolpathPoint listesi d?nd?r?r."""
     t0 = time.time()
     progress_cb(5, "Mesh hazırlanıyor...")
     mesh = build_trimesh_from_viewer(gl_viewer)
@@ -1002,206 +1016,8 @@ def generate_outline_toolpath(
         mesh_version=mesh_version,
     )
 
-    progress_cb(60, "A a??lar? hesaplan?yor...")
-    angles_raw = compute_angles_from_xy(outline_xy)
-    # A ?retim kayna?? ve filtre parametreleri
-    a_source = int(getattr(settings_tab, "a_source", 1)) if settings_tab is not None else 1
-    a_deadband = float(getattr(settings_tab, "A_DEADBAND_DEG", getattr(settings_tab, "a_deadband_deg", 0.5))) if settings_tab is not None else 0.5
-    a_max_step = float(getattr(settings_tab, "A_MAX_STEP_DEG", getattr(settings_tab, "a_max_step_deg", 5.0))) if settings_tab is not None else 5.0
-    a_smooth_window = int(getattr(settings_tab, "A_SMOOTH_WINDOW", getattr(settings_tab, "a_smooth_window", 7))) if settings_tab is not None else 7
-    a_corner_mode = str(getattr(settings_tab, "A_CORNER_MODE", getattr(settings_tab, "a_corner_mode", "blend"))).strip().lower() if settings_tab is not None else "blend"
-    a_corner_threshold = float(getattr(settings_tab, "A_CORNER_THRESHOLD_DEG", getattr(settings_tab, "a_corner_turn_deg", 25.0))) if settings_tab is not None else 25.0
-    a_alpha = float(getattr(settings_tab, "a_smooth_alpha", 0.25)) if settings_tab is not None else 0.25
-    try:
-        a_wrap = bool(getattr(settings_tab, "a_wrap", 1))
-    except Exception:
-        a_wrap = True
-    try:
-        a_deg_offset = float(
-            getattr(
-                settings_tab,
-                "A_OFFSET_DEG",
-                getattr(settings_tab, "a_offset_deg", getattr(settings_tab, "a_deg_offset", 0.0)),
-            )
-        )
-    except Exception:
-        a_deg_offset = 0.0
-    a_reverse = bool(
-        getattr(settings_tab, "A_REVERSE", getattr(settings_tab, "a_reverse", 0))
-    )
-
-    deadband_hits = 0
-    hold_hits = 0
-    snap_hits = 0
-    max_da = 0.0
-    # PR-G7.3: A source locked to XY_TANGENT
-    a_source = 1
-    a_min_xy_step = float(getattr(settings_tab, "a_min_xy_step_mm", 0.02)) if settings_tab is not None else 0.02
-    a_alpha_straight = float(getattr(settings_tab, "a_smooth_alpha_straight", 0.25)) if settings_tab is not None else 0.25
-    a_alpha_corner = float(getattr(settings_tab, "a_smooth_alpha_corner", 0.05)) if settings_tab is not None else 0.05
-    a_corner_turn = float(getattr(settings_tab, "a_corner_turn_deg", 12.0)) if settings_tab is not None else 12.0
-    a_snap_turn = float(getattr(settings_tab, "a_snap_turn_deg", a_corner_threshold)) if settings_tab is not None else a_corner_threshold
-
-    # XY tangent tabanl?, unwrap + hold + deadband + corner mode + rate limit
-    pts_xy = outline_xy
-    n_pts = len(pts_xy)
-    raw_angles = []
-    turn_degs = []
-    min_step_sq = a_min_xy_step * a_min_xy_step
-    for i in range(n_pts):
-        if n_pts < 2:
-            raw_angles.append(0.0)
-            turn_degs.append(0.0)
-            continue
-        if i == 0:
-            v_c = pts_xy[1] - pts_xy[0]
-        elif i == n_pts - 1:
-            v_c = pts_xy[-1] - pts_xy[-2]
-        else:
-            v_c = pts_xy[i + 1] - pts_xy[i - 1]
-        vlen2 = float(v_c[0] * v_c[0] + v_c[1] * v_c[1])
-        if vlen2 < min_step_sq and raw_angles:
-            ang = raw_angles[-1]
-            hold_hits += 1
-        else:
-            ang = math.degrees(math.atan2(float(v_c[1]), float(v_c[0]))) if vlen2 > 0 else (raw_angles[-1] if raw_angles else 0.0)
-        raw_angles.append(ang)
-        # corner turn estimate
-        if n_pts < 3:
-            turn_degs.append(0.0)
-        else:
-            if i == 0:
-                v_prev = pts_xy[1] - pts_xy[0]
-                v_next = pts_xy[2] - pts_xy[1] if n_pts > 2 else v_prev
-            elif i == n_pts - 1:
-                v_prev = pts_xy[i] - pts_xy[i - 1]
-                v_next = v_prev
-            else:
-                v_prev = pts_xy[i] - pts_xy[i - 1]
-                v_next = pts_xy[i + 1] - pts_xy[i]
-            n1 = math.hypot(float(v_prev[0]), float(v_prev[1]))
-            n2 = math.hypot(float(v_next[0]), float(v_next[1]))
-            if n1 < 1e-6 or n2 < 1e-6:
-                turn_degs.append(0.0)
-            else:
-                dot = (float(v_prev[0]) * float(v_next[0]) + float(v_prev[1]) * float(v_next[1])) / (n1 * n2)
-                dot = max(-1.0, min(1.0, dot))
-                turn_degs.append(math.degrees(math.acos(dot)))
-
-    angs = unwrap_angles_deg(np.array(raw_angles, dtype=np.float32)) if a_wrap else np.array(raw_angles, dtype=np.float32)
-    filtered = []
-    prev = angs[0] if len(angs) > 0 else 0.0
-    if len(angs) > 0:
-        filtered.append(prev)
-    snap_left = 0
-    for i in range(1, len(angs)):
-        ang = angs[i]
-        diff = angle_diff_deg(float(ang), float(prev))
-        max_da = max(max_da, abs(diff))
-        if abs(diff) < a_deadband:
-            ang_target = prev
-            deadband_hits += 1
-        else:
-            ang_target = ang
-        turn = turn_degs[i] if i < len(turn_degs) else 0.0
-        if a_corner_mode == "snap" and turn >= a_corner_threshold:
-            alpha_eff = 1.0
-            snap_hits += 1
-        else:
-            smooth_strength = a_alpha_straight
-            if turn >= a_corner_turn:
-                smooth_strength = a_alpha_corner
-            if a_snap_turn > 0 and turn >= a_snap_turn:
-                snap_left = max(snap_left, 2)
-            if snap_left > 0:
-                alpha_eff = 1.0
-                snap_left -= 1
-                snap_hits += 1
-            else:
-                alpha_eff = max(0.0, min(1.0, 1.0 - smooth_strength))
-        ang_out = angle_lerp_deg(float(prev), float(ang_target), alpha_eff)
-        filtered.append(ang_out)
-        prev = ang_out
-    angles = np.array(filtered, dtype=np.float32)
-    if a_corner_mode != "snap" and a_smooth_window and a_smooth_window > 1 and len(angles) > 2:
-        window = int(max(1, a_smooth_window))
-        kernel = np.ones(window, dtype=np.float64) / float(window)
-        angles = np.convolve(angles, kernel, mode="same").astype(np.float32)
-    # rate limit
-    total_a_travel = 0.0
-    max_a_step = 0.0
-    if len(angles) > 0:
-        limited = [float(angles[0])]
-        for i in range(1, len(angles)):
-            step = angle_diff_deg(float(angles[i]), float(limited[-1]))
-            if a_max_step > 0 and abs(step) > a_max_step:
-                step = math.copysign(a_max_step, step)
-            limited.append(limited[-1] + step)
-            total_a_travel += abs(step)
-            max_a_step = max(max_a_step, abs(step))
-        angles = np.array(limited, dtype=np.float32)
-    logger.info(
-        "A polish: hold=%d deadband=%d snap=%d max_dA=%.3f",
-        hold_hits,
-        deadband_hits,
-        snap_hits,
-        max_da,
-    )
-    if isinstance(z_stats, dict):
-        z_stats["total_a_travel_deg"] = float(total_a_travel)
-        z_stats["max_a_step_deg"] = float(max_a_step)
-
-    # Optional: Z-depth-based contact offset for rounded knife tip (centerline -> actual XY)
-    contact_enabled = bool(getattr(settings_tab, "knife_contact_offset_enabled", 0)) if settings_tab is not None else False
-    contact_side = int(getattr(settings_tab, "knife_contact_side", getattr(settings_tab, "kerf_side", 1))) if settings_tab is not None else 1
-    try:
-        knife_tip_diam = float(getattr(settings_tab, "knife_tip_diam", getattr(settings_tab, "knife_tip_diam_mm", 0.0)))
-    except Exception:
-        knife_tip_diam = 0.0
-    try:
-        contact_d_min = float(getattr(settings_tab, "knife_contact_d_min_mm", 0.3))
-    except Exception:
-        contact_d_min = 0.3
-    radius = max(0.0, knife_tip_diam * 0.5)
-    offset_xy = outline_xy
-    if contact_enabled and radius > 0.0:
-        sign = 1.0 if contact_side >= 0 else -1.0
-        offset_xy = outline_xy.copy()
-        for i in range(len(outline_xy)):
-            z_val = float(z_vals[i]) if i < len(z_vals) else 0.0
-            # NOTE: z is treated as positive-down depth; clamp to [0, R].
-            zc = max(0.0, min(z_val, radius))
-            d = (radius * radius - (radius - zc) ** 2) ** 0.5 if radius > 0 else 0.0
-            if d < contact_d_min:
-                d = 0.0
-                if i > 0:
-                    angles[i] = angles[i - 1]
-            normal_deg = float(angles[i]) + (90.0 * sign)
-            nx = math.cos(math.radians(normal_deg))
-            ny = math.sin(math.radians(normal_deg))
-            offset_xy[i, 0] = outline_xy[i, 0] + nx * d
-            offset_xy[i, 1] = outline_xy[i, 1] + ny * d
-        logger.info(
-            "Knife contact offset: enabled=1 radius=%.3f d_min=%.3f side=%s",
-            radius,
-            contact_d_min,
-            "LEFT" if sign >= 0 else "RIGHT",
-        )
-    elif contact_enabled:
-        logger.info("Knife contact offset enabled but tip radius is invalid; using centerline.")
-
-    # If contact model enabled, A should follow normal (not tangent).
-    if contact_enabled:
-        sign = 1.0 if contact_side >= 0 else -1.0
-        angles = angles + (90.0 * sign)
-
-    angles = angles + a_deg_offset
-    if a_reverse:
-        angles = angles + 180.0
-
-    progress_cb(80, "Tak?m yolu noktalar? olu?turuluyor...")
-    points = build_toolpath_points(offset_xy, z_vals, np.array(angles, dtype=np.float32))
-
+    progress_cb(60, "XYZ noktalar olusturuluyor...")
+    points = build_toolpath_points(outline_xy, z_vals)
     # Hedef adım (UI'daki Nokta Adımı) ile yeniden örnekle
     try:
         step_val = float(sample_step_mm)

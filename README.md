@@ -79,7 +79,7 @@ G1 X62.123 Y406.999 Z-1.000 A15.196 F1000
 - 2D sekmesinde A açıları teğetsel yön ve smoothing/pivot polish ile üretilir.
 - 3D takım yolu yalnızca XYZ üretir; A sonradan **attach** edilir (arc-length veya yakın komşu eşleme).
 - Export sırasında `output_axes=XYZA` ise A modal olarak aynı satırda yazılır; küçük değişimler `a_min_step_deg` ile filtrelenir.
-- Turn-retract kuralı: kesim sırasında 45°+ dönüşlerde Z safe’e çık, A’yı çevir, Zcut’a dön.
+- Turn-retract kuralı: kesim sırasında 45°+ dönüşlerde Z safe’ye çık, A’yı çevir, Zcut’a dön.
 
 ---
 
@@ -129,6 +129,20 @@ G1 X62.123 Y406.999 Z-1.000 A15.196 F1000
 - PyInstaller’da çoklu Qt uyarısı: Ortamda yalnızca **PyQt5** olmalı; PyQt6/PySide’ı kaldır veya spec’te exclude et.
 - INI hatası (ör. WINDOW anahtarı yok): `settings.ini`yi silip uygulamanın varsayılanı yeniden oluşturmasına izin ver.
 - Eksik kaynak dosyası: portable ini ve `resources/default_*.ini` paketlendiğinden exe ile aynı klasörde olduklarını doğrula.
+
+---
+
+## Binary Releases
+
+- Kaynak kod repoda tutulur; Windows EXE GitHub Releases altında paylaşılır.
+- Portable zip paketinde `default_settings.ini` ve `default_tool.ini` yer alır.
+- EXE repoya commitlenmez; release asset olarak yayınlanır.
+
+## Build (Windows)
+
+- `python -m pip install -r requirements.txt`
+- `pyinstaller build\\xyza.spec --noconfirm --clean`
+- `powershell -ExecutionPolicy Bypass -File tools\\release_package.ps1`
 
 ---
 

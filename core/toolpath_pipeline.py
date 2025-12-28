@@ -20,7 +20,7 @@ def _noop_progress(pct: int, msg: str = "") -> None:
 
 class ToolpathPipeline:
     """
-    UI-agnostic toolpath pipeline: contour -> Z -> A -> optional QA.
+    UI-agnostic toolpath pipeline: contour -> Z -> optional QA.
     """
 
     def generate(

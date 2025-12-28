@@ -38,7 +38,7 @@ class ToolpathPoint:
     x: float
     y: float
     z: float
-    a: float
+    a: Optional[float] = None
 
 
 @dataclass
@@ -61,6 +61,8 @@ class ProjectState:
     toolpath_result: Optional[ToolpathResult] = None  # Pipeline result (single source of truth).
     prepared_points: List[ToolpathPoint] = field(default_factory=list)
     prepared_meta: dict = field(default_factory=dict)
+    a_path_2d: Optional[dict] = None  # Last 2D A-path result (for 3D attachment).
+    a_applied_to_3d: bool = False  # Guard to prevent double-attach of A in 3D.
     gcode_text: str = ""  # Store generated G-code when explicitly requested.
     mesh_intersector_cache: MeshIntersectorCache = field(default_factory=MeshIntersectorCache)
 
@@ -70,6 +72,7 @@ class ProjectState:
         self.toolpath_result = None
         self.prepared_points.clear()
         self.prepared_meta.clear()
+        self.a_applied_to_3d = False
         self.gcode_text = ""
 
     def has_model(self):

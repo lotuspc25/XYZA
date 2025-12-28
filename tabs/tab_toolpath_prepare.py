@@ -50,20 +50,11 @@ from ui_strings import (
 )
 from project_state import ToolpathPoint, ToolpathResult  # Use shared ToolpathPoint model (single source).
 from core.toolpath_pipeline import ToolpathPipeline
-from toolpath_generator import (
-    PathIssue,
-    build_trimesh_from_viewer,
-    compute_z_for_points,
-    compute_angles_from_xy,
-    build_toolpath_points,
-    _get_blade_radius_mm,
-    resample_polyline_by_step,
-)
+from toolpath_generator import PathIssue
+from core.path_utils import find_or_create_config
 
-INI_PATH = "settings.ini"
+INI_PATH = str(find_or_create_config()[0])
 logger = logging.getLogger(__name__)
-A_SMOOTH_WINDOW = 7
-A_MAX_STEP_DEG = 12.0
 
 
 
@@ -163,6 +154,7 @@ class TabToolpath(QWidget):
         self.points_table = QTableWidget()
         self.points_table.setColumnCount(5)
         self.points_table.setHorizontalHeaderLabels(["#", "X", "Y", "Z", "A (deg)"])
+        self.points_table.setColumnHidden(4, True)
         self.points_table.verticalHeader().setVisible(False)
         self.points_table.setEditTriggers(
             QTableWidget.DoubleClicked
@@ -311,12 +303,29 @@ class TabToolpath(QWidget):
         self.z_mode_combo.addItems(Z_MODE_LABELS)
         self.z_mode_combo.currentIndexChanged.connect(self._on_params_changed)
 
+        a_source_lbl = QLabel("A Kaynağı")
+        a_source_lbl.setFont(font_label)
+        self.a_source_options = [
+            ("2D Teğet (Üstten)", "2d_tangent"),
+            ("3D Normal (Mesh)", "mesh_normal"),
+            ("Hibrit (Z=Mesh, A=2D)", "hybrid"),
+        ]
+        self.a_source_combo = QComboBox()
+        self.a_source_combo.setObjectName("aSourceCombo")
+        for text, _code in self.a_source_options:
+            self.a_source_combo.addItem(text)
+        self.a_source_combo.currentIndexChanged.connect(self._on_params_changed)
+
         gen_layout.addWidget(offset_lbl)
         gen_layout.addWidget(self.offset_spin)
         gen_layout.addWidget(step_lbl)
         gen_layout.addWidget(self.step_spin)
         gen_layout.addWidget(zmode_lbl)
         gen_layout.addWidget(self.z_mode_combo)
+        gen_layout.addWidget(a_source_lbl)
+        gen_layout.addWidget(self.a_source_combo)
+        a_source_lbl.setVisible(False)
+        self.a_source_combo.setVisible(False)
 
         self.btn_generate = QPushButton("STL'den Z-Takipli Yol Oluştur")
         self.btn_generate.setCursor(Qt.PointingHandCursor)
@@ -375,6 +384,7 @@ class TabToolpath(QWidget):
         self.lbl_issue_count.setFont(QFont("Segoe UI", 8))
         # Yeni filtre butonu: Sadece A hataları
         self.btn_filter_a_only = QPushButton("Sadece A hataları")
+        self.btn_filter_a_only.setVisible(False)
         self.btn_filter_a_only.setCheckable(True)
         self.btn_filter_a_only.setToolTip("Sadece A eksenindeki ani dönüş hatalarını göster")
         self.btn_filter_a_only.toggled.connect(self.on_filter_a_only_toggled)
@@ -590,6 +600,7 @@ class TabToolpath(QWidget):
         self._original_points = self._clone_points(self.toolpath_points)
         # Düzenlenmiş yol aktif yol, hazırlanmış yol da buna eşitlensin
         self.prepared_toolpath_points = self._clone_points(self.toolpath_points)
+        self._clear_a_overlay()
         self._history.clear()
         self._has_edit_changes = False
         self.set_toolpath_info(f"Yol düzenlendi ve kaydedildi ({len(self.toolpath_points)} nokta).")
@@ -603,6 +614,7 @@ class TabToolpath(QWidget):
             return
         snapshot = self._history.pop()
         self.toolpath_points = self._clone_points(snapshot)
+        self._clear_a_overlay()
         self._apply_points_to_viewer_and_table()
         self._has_edit_changes = bool(self._history)
 
@@ -631,6 +643,7 @@ class TabToolpath(QWidget):
         pts = self.toolpath_points
         new_pts = pts[: start + 1] + pts[end:]
         self.toolpath_points = new_pts
+        self._clear_a_overlay()
         self._apply_points_to_viewer_and_table()
         self.set_toolpath_info(f"{end - start - 1} nokta silindi.")
 
@@ -660,11 +673,11 @@ class TabToolpath(QWidget):
             x = p_start.x + (p_end.x - p_start.x) * t
             y = p_start.y + (p_end.y - p_start.y) * t
             z = p_start.z + (p_end.z - p_start.z) * t
-            a_val = p_start.a + (p_end.a - p_start.a) * t
-            new_segment.append(ToolpathPoint(x, y, z, a_val))
+            new_segment.append(ToolpathPoint(x, y, z, None))
 
         new_pts = pts[:start] + new_segment + pts[end + 1 :]
         self.toolpath_points = new_pts
+        self._clear_a_overlay()
         self._apply_points_to_viewer_and_table()
         self.set_toolpath_info("Seçilen iki nokta arasındaki segment birleştirildi.")
 
@@ -689,19 +702,17 @@ class TabToolpath(QWidget):
         half = window // 2
         for idx in range(start + 1, end):
             acc_z = 0.0
-            acc_a = 0.0
             cnt = 0
             for k in range(idx - half, idx + half + 1):
                 if k < start or k > end:
                     continue
                 p = pts[k]
                 acc_z += p.z
-                acc_a += p.a
                 cnt += 1
             if cnt > 0:
                 pts[idx].z = acc_z / cnt
-                pts[idx].a = acc_a / cnt
         self.toolpath_points = pts
+        self._clear_a_overlay()
         self._apply_points_to_viewer_and_table()
         self.set_toolpath_info("Seçilen aralıktaki noktalar yumuşatıldı.")
 
@@ -736,12 +747,14 @@ class TabToolpath(QWidget):
         contour_val = 0.0
         step_val = 0.5
         z_idx = 0
+        a_mode = "2d_tangent"
         color_hex = "#ff0000"
         width_px = 2.0
         if tab_settings is not None:
             contour_val = float(getattr(tab_settings, "contour_offset_mm", contour_val))
             step_val = float(getattr(tab_settings, "z_step_mm", step_val))
             z_idx = int(getattr(tab_settings, "z_mode_index", z_idx))
+            a_mode = str(getattr(tab_settings, "a_source_mode", a_mode)).strip().lower()
             color_hex = getattr(tab_settings, "toolpath_color_hex", color_hex)
             width_px = float(getattr(tab_settings, "toolpath_width_px", width_px))
         else:
@@ -752,6 +765,10 @@ class TabToolpath(QWidget):
                     contour_val = cfg.getfloat("APP", "contour_offset_mm", fallback=contour_val)
                     step_val = cfg.getfloat("APP", "z_step_mm", fallback=step_val)
                     z_idx = cfg.getint("APP", "z_mode", fallback=z_idx)
+                    a_mode = cfg.get("APP", "a_source_mode", fallback=a_mode).strip().lower()
+                    if a_mode not in ("2d_tangent", "mesh_normal", "hybrid"):
+                        legacy = cfg.getint("APP", "a_source", fallback=1)
+                        a_mode = {1: "2d_tangent", 2: "mesh_normal", 3: "hybrid"}.get(int(legacy), "2d_tangent")
 
             except Exception:
                 logger.exception("TabToolpath beklenmeyen hata")
@@ -759,13 +776,24 @@ class TabToolpath(QWidget):
             self.offset_spin.blockSignals(True)
             self.step_spin.blockSignals(True)
             self.z_mode_combo.blockSignals(True)
+            if hasattr(self, "a_source_combo"):
+                self.a_source_combo.blockSignals(True)
             self.offset_spin.setValue(contour_val)
             self.step_spin.setValue(step_val)
             self.z_mode_combo.setCurrentIndex(z_idx)
+            if hasattr(self, "a_source_combo"):
+                idx = 0
+                for i, (_text, code) in enumerate(self.a_source_options):
+                    if code == a_mode:
+                        idx = i
+                        break
+                self.a_source_combo.setCurrentIndex(idx)
         finally:
             self.offset_spin.blockSignals(False)
             self.step_spin.blockSignals(False)
             self.z_mode_combo.blockSignals(False)
+            if hasattr(self, "a_source_combo"):
+                self.a_source_combo.blockSignals(False)
         self.apply_toolpath_style_from_settings(color_hex, width_px)
         # Model sekmesindeki spin ile senkron tut
         tab_model = getattr(self.main_window, "tab_model", None)
@@ -806,8 +834,13 @@ class TabToolpath(QWidget):
         offset_mm = float(self.offset_spin.value())
         step_mm = float(self.step_spin.value())
         mode_idx = int(self.z_mode_combo.currentIndex())
+        a_mode = "2d_tangent"
+        if hasattr(self, "a_source_combo"):
+            idx = int(self.a_source_combo.currentIndex())
+            if 0 <= idx < len(self.a_source_options):
+                a_mode = self.a_source_options[idx][1]
 
-        self._write_params_to_settings_tab(offset_mm, step_mm, mode_idx)
+        self._write_params_to_settings_tab(offset_mm, step_mm, mode_idx, a_mode)
         tab_model = getattr(self.main_window, "tab_model", None)
         if tab_model is not None and hasattr(tab_model, "spin_model_offset"):
             tab_model.spin_model_offset.blockSignals(True)
@@ -927,8 +960,7 @@ class TabToolpath(QWidget):
             except Exception:
                 logger.exception("Issue indexleri s?f?rlanamad?")
 
-        offset_a = float(getattr(self, "knife_a_offset_deg", 0.0))
-        self._recompute_a_for_points(self.toolpath_points, knife_offset_deg=offset_a)
+        self._clear_a_overlay()
 
         try:
             pts_arr = np.array([[p.x, p.y, p.z] for p in self.toolpath_points], dtype=np.float32)
@@ -976,13 +1008,6 @@ class TabToolpath(QWidget):
                 info_txt += f" (multi-hit: {z_stats.get('multi_hit_points', 0)}, continuity: {z_stats.get('continuity_used', 0)})"
             except Exception:
                 pass
-        if z_stats and "total_a_travel_deg" in z_stats and "max_a_step_deg" in z_stats:
-            try:
-                total_a = float(z_stats.get("total_a_travel_deg", 0.0))
-                max_a = float(z_stats.get("max_a_step_deg", 0.0))
-                info_txt += f" | A toplam: {total_a:.1f}° max adım: {max_a:.1f}°"
-            except Exception:
-                logger.exception("A metrikleri yazılamadı")
         self.set_toolpath_info(info_txt)
         self._update_points_table()
         try:
@@ -1007,6 +1032,7 @@ class TabToolpath(QWidget):
             self.state.prepared_meta = meta_prepared
             self.state.toolpath_points = self._clone_points(points)  # NOTE: Store toolpath for G-code stage.
             self.state.gcode_text = ""  # NOTE: Clear G-code until explicitly generated.
+            self.state.a_applied_to_3d = False
             if self.state.toolpath_result is not None:
                 self.state.toolpath_result.points = self._clone_points(points)
                 self.state.toolpath_result.meta.update(meta_prepared)
@@ -1039,8 +1065,8 @@ class TabToolpath(QWidget):
         if z_max is None:
             z_max = getattr(tab_settings, "safe_z", None)
         z_min = getattr(tab_settings, "z_min_mm", None)
-        a_min = getattr(tab_settings, "knife_a_min_deg", None)
-        a_max = getattr(tab_settings, "knife_a_max_deg", None)
+        a_min = None
+        a_max = None
         opts = self.analysis_options or {}
 
         issues: List[PathIssue] = []
@@ -1222,10 +1248,7 @@ class TabToolpath(QWidget):
 
         self.prepared_toolpath_points = self._clone_points(new_points)
         self.toolpath_points = self._clone_points(new_points)
-
-        # A açılarını yeniden hesapla (bıçak offset'i varsa ekle)
-        offset_a = float(getattr(self, "knife_a_offset_deg", 0.0))
-        self._recompute_a_for_points(self.toolpath_points, knife_offset_deg=offset_a)
+        self._clear_a_overlay()
 
         try:
             pts_arr = np.array([[p.x, p.y, p.z] for p in self.toolpath_points], dtype=np.float32)
@@ -1261,6 +1284,7 @@ class TabToolpath(QWidget):
         last_state = self.toolpath_history.pop()
         self.toolpath_points = self._clone_points(last_state)
         self.prepared_toolpath_points = self._clone_points(last_state)
+        self._clear_a_overlay()
 
         if self.viewer is not None and hasattr(self.viewer, "set_toolpath_polyline"):
             try:
@@ -1334,7 +1358,10 @@ class TabToolpath(QWidget):
             QMessageBox.critical(self, "A Açısı Eğrisi", "Matplotlib kütüphanesi yüklü değil. Grafik için: pip install matplotlib")
             return
         indices = list(range(1, len(self.toolpath_points) + 1))
-        a_vals = [p.a for p in self.toolpath_points]
+        a_vals = [p.a for p in self.toolpath_points if p.a is not None]
+        if not a_vals:
+            QMessageBox.information(self, "A Acisi Egrisi", "A verisi yok. Once A Yolu Uretin.")
+            return
         plt.figure("A Açısının Değişimi")
         plt.plot(indices, a_vals, label="A (deg)", color="orange")
         plt.grid(True)
@@ -1390,12 +1417,13 @@ class TabToolpath(QWidget):
         try:
             self.points_table.setRowCount(len(pts))
             for i, pt in enumerate(pts):
+                a_text = "" if pt.a is None else f"{pt.a:.3f}"
                 values = [
                     str(i + 1),
                     f"{pt.x:.3f}",
                     f"{pt.y:.3f}",
                     f"{pt.z:.3f}",
-                    f"{pt.a:.3f}",
+                    a_text,
                 ]
                 for col, val in enumerate(values):
                     item = QTableWidgetItem(val)
@@ -1447,7 +1475,7 @@ class TabToolpath(QWidget):
     def _build_real_offset_toolpath(self, real_offset_mm: float) -> List[ToolpathPoint]:
         """
         Mevcut toolpath_points listesinden, XY düzleminde real_offset_mm kadar kaydırılmış yeni bir
-        takım yolu üretir. Ardından min mesafe + min açı kriteri ile noktaları seyrekleştirir. Z ve A
+        takım yolu üretir. Ardından min mesafe + min açı kriteri ile noktaları seyrekleştirir. Z
         değerleri korunur.
         """
         base = self.toolpath_points
@@ -1455,9 +1483,9 @@ class TabToolpath(QWidget):
             return []
 
         if abs(real_offset_mm) < 1e-4:
-            return self._clone_points(base)
+            return [ToolpathPoint(p.x, p.y, p.z, None) for p in base]
 
-        pts = self._clone_points(base)
+        pts = [ToolpathPoint(p.x, p.y, p.z, None) for p in base]
         n = len(pts)
         offset_pts: List[ToolpathPoint] = []
 
@@ -1484,7 +1512,7 @@ class TabToolpath(QWidget):
                 ny = vx
 
             o = real_offset_mm
-            offset_pts.append(ToolpathPoint(p.x + nx * o, p.y + ny * o, p.z, p.a))
+            offset_pts.append(ToolpathPoint(p.x + nx * o, p.y + ny * o, p.z, None))
 
         if len(offset_pts) < 3:
             return offset_pts
@@ -1575,6 +1603,49 @@ class TabToolpath(QWidget):
     def _clone_points(self, points: List[ToolpathPoint]) -> List[ToolpathPoint]:
         return [ToolpathPoint(p.x, p.y, p.z, p.a) for p in points]
 
+    def _clear_a_overlay(self):
+        pts = self.toolpath_points or self.prepared_toolpath_points or self.original_toolpath_points or []
+        if not pts:
+            return
+        for group in (self.toolpath_points, self.original_toolpath_points, self.prepared_toolpath_points):
+            for p in group or []:
+                p.a = None
+        try:
+            if self.state is not None:
+                self.state.toolpath_points = self._clone_points(pts)
+                self.state.prepared_points = self._clone_points(pts)
+                self.state.a_applied_to_3d = False
+                if isinstance(getattr(self.state, "prepared_meta", None), dict):
+                    self.state.prepared_meta.pop("a_meta", None)
+                if self.state.toolpath_result is not None:
+                    self.state.toolpath_result.points = self._clone_points(pts)
+                    if isinstance(self.state.toolpath_result.meta, dict):
+                        self.state.toolpath_result.meta.pop("a_meta", None)
+        except Exception:
+            logger.exception("A overlay state temizlenemedi")
+        tab_2d = getattr(self.main_window, "page_2d", None)
+        if tab_2d is not None and hasattr(tab_2d, "set_toolpath_points"):
+            try:
+                tab_2d.set_toolpath_points(self._clone_points(pts), label="3D Yol")
+            except Exception:
+                logger.exception("2D yol guncellenemedi")
+        elif tab_2d is not None and hasattr(tab_2d, "clear_a_overlay"):
+            try:
+                tab_2d.clear_a_overlay()
+            except Exception:
+                logger.exception("2D A overlay temizlenemedi")
+        builder = getattr(self.main_window, "tab_toolpath_builder", None)
+        if builder is not None and hasattr(builder, "load_prepared_data"):
+            try:
+                meta_prepared = getattr(self.state, "prepared_meta", {}) if self.state is not None else {}
+                if isinstance(meta_prepared, dict):
+                    meta_prepared = dict(meta_prepared)
+                    meta_prepared.pop("a_meta", None)
+                builder.load_prepared_data(self._clone_points(pts), meta_prepared, "")
+            except Exception:
+                logger.exception("Builder A overlay temizlenemedi")
+
+
     def _push_history(self, reason: str = ""):
         """
         Mevcut toolpath_points listesinin kopyasını history'e ekler.
@@ -1617,12 +1688,13 @@ class TabToolpath(QWidget):
             try:
                 self.points_table.setRowCount(len(pts))
                 for i, p in enumerate(pts):
+                    a_text = "" if p.a is None else f"{p.a:.3f}"
                     values = [
                         str(i + 1),
                         f"{p.x:.3f}",
                         f"{p.y:.3f}",
                         f"{p.z:.3f}",
-                        f"{p.a:.3f}",
+                        a_text,
                     ]
                     for col, val in enumerate(values):
                         item = QTableWidgetItem(val)
@@ -1675,7 +1747,7 @@ class TabToolpath(QWidget):
 
         pt = self.toolpath_points[primary]
         self.set_toolpath_info(
-            f"Seçim: #{primary+1} | X={pt.x:.3f}, Y={pt.y:.3f}, Z={pt.z:.3f}, A={pt.a:.3f}"
+            f"Seçim: #{primary+1} | X={pt.x:.3f}, Y={pt.y:.3f}, Z={pt.z:.3f}"
         )
 
     def _on_table_cell_clicked(self, row: int, _col: int):
@@ -1690,7 +1762,7 @@ class TabToolpath(QWidget):
             self.viewer.set_selected_index(int(row))
         pt = self.toolpath_points[row]
         self.set_toolpath_info(
-            f"Seçim: #{row+1} | X={pt.x:.3f}, Y={pt.y:.3f}, Z={pt.z:.3f}, A={pt.a:.3f}"
+            f"Seçim: #{row+1} | X={pt.x:.3f}, Y={pt.y:.3f}, Z={pt.z:.3f}"
         )
 
     def _on_viewer_point_selected(self, index: int, _pt):
@@ -1734,9 +1806,9 @@ class TabToolpath(QWidget):
             length += (dx * dx + dy * dy + dz * dz) ** 0.5
 
         z_vals = [p.z for p in pts]
-        a_vals = [p.a for p in pts]
+        a_vals = [p.a for p in pts if p.a is not None]
         z_min, z_max = (min(z_vals), max(z_vals)) if z_vals else (0.0, 0.0)
-        a_min, a_max = (min(a_vals), max(a_vals)) if a_vals else (0.0, 0.0)
+        a_min, a_max = (min(a_vals), max(a_vals)) if a_vals else (None, None)
 
         feed_xy = None
         settings_tab = getattr(self.main_window, "tab_settings", None)
@@ -1821,7 +1893,8 @@ class TabToolpath(QWidget):
                 writer = csv.writer(f)
                 writer.writerow(["x", "y", "z", "a"])
                 for pt in self.toolpath_points:
-                    writer.writerow([pt.x, pt.y, pt.z, pt.a])
+                    a_val = "" if pt.a is None else pt.a
+                    writer.writerow([pt.x, pt.y, pt.z, a_val])
             self.set_toolpath_info(f"CSV kaydedildi: {filename}")
         except Exception as exc:
             QMessageBox.critical(self, "Noktaları Kaydet", f"CSV kaydedilemedi: {exc}")
@@ -1836,13 +1909,14 @@ class TabToolpath(QWidget):
             QMessageBox.critical(self, "Noktaları Kaydet", f"JSON kaydedilemedi: {exc}")
 
 
-    def _write_params_to_settings_tab(self, offset_mm: float, step_mm: float, mode_idx: int):
+    def _write_params_to_settings_tab(self, offset_mm: float, step_mm: float, mode_idx: int, a_source_mode: str):
         tab_settings = getattr(self.main_window, "tab_settings", None)
         if tab_settings is None:
             return
         tab_settings.contour_offset_mm = offset_mm
         tab_settings.z_step_mm = step_mm
         tab_settings.z_mode_index = mode_idx
+        tab_settings.a_source_mode = str(a_source_mode or "2d_tangent").strip().lower()
         # Ayarlar sekmesindeki spinbox'ı da güncel tut
         if hasattr(tab_settings, "spin_contour_offset"):
             try:
@@ -1865,10 +1939,16 @@ class TabToolpath(QWidget):
 
     def _on_params_changed(self, _value=None):
         """Spinbox/combobox değişince değerleri Ayarlar sekmesine yazar."""
+        a_mode = "2d_tangent"
+        if hasattr(self, "a_source_combo"):
+            idx = int(self.a_source_combo.currentIndex())
+            if 0 <= idx < len(self.a_source_options):
+                a_mode = self.a_source_options[idx][1]
         self._write_params_to_settings_tab(
             float(self.offset_spin.value()),
             float(self.step_spin.value()),
             int(self.z_mode_combo.currentIndex()),
+            a_mode,
         )
         if hasattr(self, "offset_spin") and hasattr(self, "real_offset_spin"):
             try:
@@ -2011,13 +2091,6 @@ class TabToolpath(QWidget):
         form = QFormLayout(dlg)
         form.setSpacing(6)
 
-        spin_a = QDoubleSpinBox()
-        spin_a.setDecimals(1)
-        spin_a.setRange(0.0, 360.0)
-        spin_a.setValue(float(self.analysis_options.get("angle_threshold", 30.0)))
-        spin_a.setSuffix(" °")
-        form.addRow("A eşiği (ΔA)", spin_a)
-
         spin_z = QDoubleSpinBox()
         spin_z.setDecimals(3)
         spin_z.setRange(0.0, 50.0)
@@ -2053,7 +2126,6 @@ class TabToolpath(QWidget):
         buttons.rejected.connect(dlg.reject)
 
         if dlg.exec_() == QDialog.Accepted:
-            self.analysis_options["angle_threshold"] = float(spin_a.value())
             self.analysis_options["z_threshold"] = float(spin_z.value())
             self.analysis_options["dir_threshold"] = float(spin_dir.value())
             self.analysis_options["xy_spike_threshold"] = float(spin_xy.value())
@@ -2083,8 +2155,8 @@ class TabToolpath(QWidget):
         if z_max is None:
             z_max = getattr(tab_settings, "safe_z", None)
         z_min = getattr(tab_settings, "z_min_mm", None)
-        a_min = getattr(tab_settings, "knife_a_min_deg", None)
-        a_max = getattr(tab_settings, "knife_a_max_deg", None)
+        a_min = None
+        a_max = None
         opts = self.analysis_options or {}
         show_raw = bool(getattr(self.chk_show_raw_issues, "isChecked", lambda: False)())
         self.analysis_options["show_raw"] = show_raw
@@ -2260,110 +2332,6 @@ class TabToolpath(QWidget):
             except Exception:
                 logger.exception("TabToolpath beklenmeyen hata")
 
-    def _recompute_a_for_points(self, points, knife_offset_deg: float = 0.0):
-        """
-        Verilen ToolpathPoint listesindeki X/Y/Z'e göre A açılarını yeniden hesaplar.
-        Tangente göre açı bulur, wrap/unwrap ile sürekliliği korur, isteğe bağlı offset ekler.
-        """
-        if not points or len(points) < 2:
-            return
-        # NOTE: A offset/reverse settings are applied in addition to knife offset.
-        settings_tab = getattr(self.main_window, "tab_settings", None)
-        try:
-            extra_offset = float(
-                getattr(
-                    settings_tab,
-                    "A_OFFSET_DEG",
-                    getattr(settings_tab, "a_offset_deg", getattr(settings_tab, "a_deg_offset", 0.0)),
-                )
-            )
-        except Exception:
-            extra_offset = 0.0
-        a_reverse = bool(getattr(settings_tab, "A_REVERSE", getattr(settings_tab, "a_reverse", 0)))
-        total_offset = float(knife_offset_deg) + float(extra_offset)
-        contact_enabled = bool(getattr(settings_tab, "knife_contact_offset_enabled", 0)) if settings_tab is not None else False
-        contact_side = int(getattr(settings_tab, "knife_contact_side", getattr(settings_tab, "kerf_side", 1))) if settings_tab is not None else 1
-        try:
-            contact_d_min = float(getattr(settings_tab, "knife_contact_d_min_mm", 0.3))
-        except Exception:
-            contact_d_min = 0.3
-        radius = _get_blade_radius_mm(settings_tab)
-        contact_enabled = contact_enabled and radius > 0.0
-
-        prev_angle = None
-        n = len(points)
-
-        for i, p in enumerate(points):
-            if n == 1:
-                dx, dy = 1.0, 0.0
-            elif i == 0:
-                dx = points[1].x - points[0].x
-                dy = points[1].y - points[0].y
-            elif i == n - 1:
-                dx = points[-1].x - points[-2].x
-                dy = points[-1].y - points[-2].y
-            else:
-                dx = points[i + 1].x - points[i - 1].x
-                dy = points[i + 1].y - points[i - 1].y
-
-            if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-                if prev_angle is not None:
-                    p.a = prev_angle
-                continue
-
-            base_angle = math.degrees(math.atan2(dy, dx))
-            if contact_enabled:
-                sign = 1.0 if contact_side >= 0 else -1.0
-                z_val = float(getattr(p, "z", 0.0))
-                depth = max(0.0, min(-z_val, radius)) if radius > 0 else 0.0
-                d_sq = max(0.0, radius * radius - (radius - depth) ** 2) if radius > 0 else 0.0
-                d = math.sqrt(d_sq) if radius > 0 else 0.0
-                normal_angle = base_angle + (90.0 * sign)
-                if d < contact_d_min and prev_angle is not None:
-                    normal_angle = prev_angle
-                base_angle = normal_angle
-
-            if prev_angle is None:
-                angle = base_angle
-            else:
-                diff = base_angle - prev_angle
-                while diff > 180.0:
-                    diff -= 360.0
-                while diff < -180.0:
-                    diff += 360.0
-                angle = prev_angle + diff
-
-            p.a = angle
-            prev_angle = angle
-
-        try:
-            angles = np.array([p.a for p in points], dtype=np.float64)
-            angles_rad = np.deg2rad(angles)
-            angles_unwrapped = np.unwrap(angles_rad)
-            angles_deg = np.rad2deg(angles_unwrapped)
-
-            if A_SMOOTH_WINDOW and A_SMOOTH_WINDOW > 1:
-                window = int(max(1, A_SMOOTH_WINDOW))
-                kernel = np.ones(window, dtype=np.float64) / float(window)
-                angles_deg = np.convolve(angles_deg, kernel, mode="same")
-
-            if A_MAX_STEP_DEG is not None:
-                max_step = float(A_MAX_STEP_DEG)
-                for i in range(1, len(angles_deg)):
-                    delta = angles_deg[i] - angles_deg[i - 1]
-                    if delta > max_step:
-                        angles_deg[i] = angles_deg[i - 1] + max_step
-                    elif delta < -max_step:
-                        angles_deg[i] = angles_deg[i - 1] - max_step
-
-            for p, ang in zip(points, angles_deg):
-                adj = float(ang) + total_offset
-                if a_reverse:
-                    adj += 180.0
-                p.a = adj
-        except Exception:
-            logger.exception("A açısı stabilizasyonu uygulanamadı")
-
     def apply_toolpath_style_from_settings(
         self,
         color_hex: str,
@@ -2386,7 +2354,7 @@ class TabToolpath(QWidget):
 
     def _on_points_item_changed(self, item: QTableWidgetItem):
         """
-        Nokta Listesi'nde X/Y/Z/A hücresi değiştiğinde veriyi ve viewer'ı günceller.
+        Nokta Listesi'nde X/Y/Z hücresi değiştiğinde veriyi ve viewer'ı günceller.
         """
         if self._points_table_updating:
             return
@@ -2406,7 +2374,7 @@ class TabToolpath(QWidget):
                 self._points_table_updating = False
             return
 
-        if col not in (1, 2, 3, 4):
+        if col not in (1, 2, 3):
             return
 
         text = (item.text() or "").strip().replace(",", ".")
@@ -2414,7 +2382,7 @@ class TabToolpath(QWidget):
             val = float(text)
         except ValueError:
             p = self.toolpath_points[row]
-            old = [p.x, p.y, p.z, p.a][col - 1]
+            old = [p.x, p.y, p.z][col - 1]
             self._points_table_updating = True
             try:
                 item.setText(f"{old:.3f}")
@@ -2433,8 +2401,8 @@ class TabToolpath(QWidget):
             p.y = val
         elif col == 3:
             p.z = val
-        elif col == 4:
-            p.a = val
+
+        self._clear_a_overlay()
 
         if self.viewer is not None and self.toolpath_points:
             pts_arr = np.array([[tp.x, tp.y, tp.z] for tp in self.toolpath_points], dtype=np.float32)

@@ -12,6 +12,7 @@
 # pyright: reportMissingImports=false, reportUndefinedVariable=false
 
 import configparser
+import ctypes
 import logging
 import math
 import os
@@ -19,7 +20,7 @@ import numpy as np
 from typing import Callable, Optional, Iterable, List
 from stl import mesh as stl_mesh
 from PyQt5.QtWidgets import QOpenGLWidget
-from PyQt5.QtCore import Qt, QPoint, pyqtSignal
+from PyQt5.QtCore import Qt, QPoint, pyqtSignal, QTimer
 from PyQt5.QtGui import QMatrix4x4, QVector3D, QCursor
 
 from OpenGL.GL import *
@@ -29,6 +30,8 @@ from OpenGL.GLU import (
     gluProject,
 )
 from OpenGL.GLUT import glutInit, glutBitmapCharacter, GLUT_BITMAP_HELVETICA_18
+from core.render_lod import decimate_line_strip
+from core.path_utils import find_or_create_config
 
 
 logger = logging.getLogger(__name__)
@@ -39,7 +42,95 @@ if not logger.handlers:
     fh.setFormatter(fmt)
     logger.addHandler(fh)
 
-INI_PATH = os.path.join(os.path.dirname(__file__), "settings.ini")
+INI_PATH = str(find_or_create_config()[0])
+
+
+class ToolpathRenderCache:
+    def __init__(self, lod_target: int = 10000):
+        self.last_toolpath_version = -1
+        self.vbo_full = None
+        self.vbo_lod = None
+        self.vertex_count_full = 0
+        self.vertex_count_lod = 0
+        self.cpu_vertices_full = None
+        self.cpu_vertices_lod = None
+        self.lod_target = max(2, int(lod_target))
+        self._dirty = True
+
+    def invalidate(self) -> None:
+        self._dirty = True
+
+    def clear_gpu_buffers(self) -> None:
+        if self.vbo_full:
+            try:
+                glDeleteBuffers(1, [self.vbo_full])
+            except Exception:
+                pass
+        if self.vbo_lod and self.vbo_lod != self.vbo_full:
+            try:
+                glDeleteBuffers(1, [self.vbo_lod])
+            except Exception:
+                pass
+        self.vbo_full = None
+        self.vbo_lod = None
+        self._dirty = True
+
+    def build_cpu_arrays(self, points: Optional[np.ndarray]) -> None:
+        if points is None:
+            self.cpu_vertices_full = None
+            self.cpu_vertices_lod = None
+            self.vertex_count_full = 0
+            self.vertex_count_lod = 0
+            self._dirty = True
+            return
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[1] != 3 or pts.shape[0] < 2:
+            self.cpu_vertices_full = None
+            self.cpu_vertices_lod = None
+            self.vertex_count_full = 0
+            self.vertex_count_lod = 0
+            self._dirty = True
+            return
+        pts = np.ascontiguousarray(pts)
+        self.cpu_vertices_full = pts
+        self.vertex_count_full = int(pts.shape[0])
+        lod_pts = decimate_line_strip(pts, self.lod_target)
+        self.cpu_vertices_lod = np.ascontiguousarray(lod_pts)
+        self.vertex_count_lod = int(self.cpu_vertices_lod.shape[0])
+        self._dirty = True
+
+    def ensure_gpu_buffers(self) -> None:
+        if not self._dirty:
+            return
+        self.clear_gpu_buffers()
+        if self.cpu_vertices_full is None or self.vertex_count_full < 2:
+            return
+        self.vbo_full = self._create_vbo(self.cpu_vertices_full)
+        if self.cpu_vertices_lod is self.cpu_vertices_full or self.vertex_count_lod == self.vertex_count_full:
+            self.vbo_lod = self.vbo_full
+        else:
+            self.vbo_lod = self._create_vbo(self.cpu_vertices_lod)
+        self._dirty = False
+        logger.info(
+            "Render cache: rebuilt VBO (full=%s, lod=%s)",
+            self.vertex_count_full,
+            self.vertex_count_lod,
+        )
+
+    def _create_vbo(self, vertices: np.ndarray):
+        try:
+            vbo_id = glGenBuffers(1)
+            if isinstance(vbo_id, (list, tuple)):
+                vbo_id = vbo_id[0]
+            if not vbo_id:
+                return None
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_id)
+            glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            return vbo_id
+        except Exception:
+            return None
+
 
 
 class GLTableViewer(QOpenGLWidget):
@@ -105,6 +196,13 @@ class GLTableViewer(QOpenGLWidget):
         self.toolpath_width = 2.0
         self.point_color = (1.0, 1.0, 0.0)
         self.point_size_px = 4.0
+        self.toolpath_version = 0
+        self.toolpath_lod_max_points = 10000
+        self._toolpath_render_cache = ToolpathRenderCache(self.toolpath_lod_max_points)
+        self._is_interacting = False
+        self._interaction_timer = QTimer(self)
+        self._interaction_timer.setSingleShot(True)
+        self._interaction_timer.timeout.connect(self._end_interaction)
         self.first_point_color = (1.0, 0.0, 0.0)
         self.second_point_color = (0.0, 1.0, 0.0)
         self.primary_index = -1
@@ -152,17 +250,37 @@ class GLTableViewer(QOpenGLWidget):
     def set_table_size(self, width_mm, height_mm):
         self.table_width = float(width_mm)
         self.table_height = float(height_mm)
-        self._bump_mesh_version()
         self.update()
 
     def set_origin_mode(self, mode):
         # mode: center, front_left, front_right, back_left, back_right
         self.origin_mode = mode
-        self._bump_mesh_version()
         self.update()
 
     def _bump_mesh_version(self):
         self.mesh_version = int(getattr(self, "mesh_version", 0)) + 1
+
+    def _bump_toolpath_version(self):
+        self.toolpath_version = int(getattr(self, "toolpath_version", 0)) + 1
+        if getattr(self, "_toolpath_render_cache", None) is not None:
+            self._toolpath_render_cache.invalidate()
+
+    def _should_use_lod(self, count: int) -> bool:
+        if count <= 0:
+            return False
+        if count > self.toolpath_lod_max_points:
+            return True
+        return bool(self._is_interacting)
+
+    def _note_interaction(self):
+        self._is_interacting = True
+        if self._interaction_timer is not None:
+            self._interaction_timer.start(150)
+
+    def _end_interaction(self):
+        if self._is_interacting:
+            self._is_interacting = False
+            self.update()
 
     def set_camera_angles(self, rx: Optional[float] = None, ry: Optional[float] = None, rz: Optional[float] = None):
         if rx is not None:
@@ -936,6 +1054,7 @@ class GLTableViewer(QOpenGLWidget):
         self.primary_index = -1
         self.secondary_index = -1
         self._dragging = False
+        self._bump_toolpath_version()
         self.update()
         if self.on_point_selected is not None:
             self.on_point_selected(-1, None)
@@ -1081,6 +1200,7 @@ class GLTableViewer(QOpenGLWidget):
         if self.toolpath_polyline is None or idx < 0 or idx >= len(self.toolpath_polyline):
             return
         self.toolpath_polyline[idx] = new_pt
+        self._bump_toolpath_version()
         if self.on_point_moved is not None:
             self.on_point_moved(idx, float(new_pt[0]), float(new_pt[1]), float(new_pt[2]))
         if self.on_point_selected is not None:
@@ -1091,6 +1211,7 @@ class GLTableViewer(QOpenGLWidget):
     # Mouse / tekerlek etkileÅŸimleri
     # ------------------------------------------------------
     def mousePressEvent(self, event):
+        self._note_interaction()
         self._last_pos = event.pos()
         if self.z_depth_mode and event.button() == Qt.LeftButton:
             hit = self._raycast_mesh(event.x(), event.y())
@@ -1142,6 +1263,8 @@ class GLTableViewer(QOpenGLWidget):
         super().mousePressEvent(event) if hasattr(super(), "mousePressEvent") else None
 
     def mouseMoveEvent(self, event):
+        if event.buttons():
+            self._note_interaction()
         dx = event.x() - self._last_pos.x()
         dy = event.y() - self._last_pos.y()
 
@@ -1186,6 +1309,7 @@ class GLTableViewer(QOpenGLWidget):
         super().mouseReleaseEvent(event) if hasattr(super(), "mouseReleaseEvent") else None
 
     def wheelEvent(self, event):
+        self._note_interaction()
         delta = event.angleDelta().y() / 120.0  # her tik ~ 1
         if delta > 0:
             self.dist /= self.zoom_sensitivity
@@ -1257,22 +1381,56 @@ class GLTableViewer(QOpenGLWidget):
     def _draw_toolpath(self):
         """Toolpath'? basit polyline olarak ?izer."""
         if self.toolpath_polyline is None:
+            if getattr(self, "_toolpath_render_cache", None) is not None:
+                self._toolpath_render_cache.clear_gpu_buffers()
             return
         pts = self.toolpath_polyline
         if not isinstance(pts, np.ndarray) or pts.shape[0] < 2:
+            if getattr(self, "_toolpath_render_cache", None) is not None:
+                self._toolpath_render_cache.clear_gpu_buffers()
             return
         # NOTE: Pivot preview uses a separate polyline for visual-only rounding.
-        draw_pts = pts
-        if self.pivot_preview_enabled and self._pivot_preview_polyline is not None:
-            draw_pts = self._pivot_preview_polyline
+        preview_active = self.pivot_preview_enabled and self._pivot_preview_polyline is not None
+        draw_pts = self._pivot_preview_polyline if preview_active else pts
+        cache = getattr(self, "_toolpath_render_cache", None)
+        use_lod = False
+        vbo_id = None
+        vbo_count = 0
+        if cache is not None:
+            if self.toolpath_version != cache.last_toolpath_version:
+                cache.build_cpu_arrays(pts)
+                cache.last_toolpath_version = self.toolpath_version
+            if not preview_active:
+                cache.ensure_gpu_buffers()
+                use_lod = self._should_use_lod(int(len(pts)))
+                if use_lod:
+                    vbo_id = cache.vbo_lod
+                    vbo_count = cache.vertex_count_lod
+                else:
+                    vbo_id = cache.vbo_full
+                    vbo_count = cache.vertex_count_full
+        line_pts = draw_pts
+        if cache is not None and not preview_active:
+            if use_lod and cache.cpu_vertices_lod is not None:
+                line_pts = cache.cpu_vertices_lod
+            elif cache.cpu_vertices_full is not None:
+                line_pts = cache.cpu_vertices_full
         glDisable(GL_LIGHTING)
         glLineWidth(self.toolpath_width)
         r, g, b = self.toolpath_color
         glColor3f(r, g, b)
-        glBegin(GL_LINE_STRIP)
-        for x, y, z in draw_pts:
-            glVertex3f(float(x), float(y), float(z))
-        glEnd()
+        if vbo_id and vbo_count >= 2:
+            glEnableClientState(GL_VERTEX_ARRAY)
+            glBindBuffer(GL_ARRAY_BUFFER, vbo_id)
+            glVertexPointer(3, GL_FLOAT, 0, ctypes.c_void_p(0))
+            glDrawArrays(GL_LINE_STRIP, 0, vbo_count)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            glDisableClientState(GL_VERTEX_ARRAY)
+        else:
+            glBegin(GL_LINE_STRIP)
+            for x, y, z in line_pts:
+                glVertex3f(float(x), float(y), float(z))
+            glEnd()
 
         # Orijinal yolu ince Ã§izgi olarak Ã§iz
         if self.show_original_toolpath and self.original_toolpath_polyline is not None:
@@ -1293,7 +1451,10 @@ class GLTableViewer(QOpenGLWidget):
         glPointSize(base_point_size)
         glColor3f(pr, pg, pb)
         glBegin(GL_POINTS)
-        for x, y, z in pts:
+        point_pts = pts
+        if not self.pivot_preview_enabled or self._pivot_preview_polyline is None:
+            point_pts = line_pts
+        for x, y, z in point_pts:
             glVertex3f(float(x), float(y), float(z))
         glEnd()
         glPointSize(1.0)

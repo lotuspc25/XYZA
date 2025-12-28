@@ -27,6 +27,7 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtCore import Qt, QThreadPool
 
 from gl_viewer import GLTableViewer
+from core.path_utils import find_or_create_config
 from project_state import STLModel
 from async_workers import WorkerRunnable
 from ui_strings import (
@@ -48,7 +49,7 @@ from ui_strings import (
 
 
 logger = logging.getLogger(__name__)
-INI_PATH = "settings.ini"
+INI_PATH = str(find_or_create_config()[0])
 
 
 class TabModel(QWidget):
