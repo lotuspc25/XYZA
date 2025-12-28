@@ -146,22 +146,28 @@ G1 X62.123 Y406.999 Z-1.000 A15.196 F1000
 
 ---
 
-## Screenshots
 
-### Main UI
-![Main UI](docs/screenshots/ui-main.png)
 
-### 2D A-axis generation
-![2D A axis](docs/screenshots/tab-2d-a-axis.png)
+## 📸 Screenshots
 
-### 3D simulation
-![3D Sim](docs/screenshots/tab-3d-sim.png)
+### Main Interface
+![Main UI](docs/screenshots/1.png)
 
-### G-code export
-![G-code](docs/screenshots/gcode-export.png)
+### 2D Toolpath & A-axis Generation
+![2D A Axis](docs/screenshots/2.png)
 
-### Portable config
-![Portable config](docs/screenshots/settings-portable.png)
+### 3D Simulation
+![3D Simulation](docs/screenshots/3.png)
+
+### G-code Export
+![G-code Export](docs/screenshots/4.png)
+
+### Portable Configuration (Mach3)
+![Portable Config](docs/screenshots/5.png)
+
+### Machine Start Position (G53 → G54)
+![Startup Position](docs/screenshots/6.png)
+
 
 
 ## 📜 Lisans
